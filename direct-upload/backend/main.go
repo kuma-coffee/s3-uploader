@@ -4,70 +4,106 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-func main() {
-	const (
-		endpoint  = "localhost:9000"
-		accessKey = "minioadmin"
-		secretKey = "minioadmin123"
-		bucket    = "uploads"
-		port      = "8080"
+const (
+	Bucket = "direct-uploads"
+	Region = "us-east-1"
+
+	AccessKey = "minioadmin"
+	SecretKey = "minioadmin123"
+
+	Endpoint = "http://localhost:9000"
+
+	ServerPort = ":8080"
+)
+
+func initMinioBucket(ctx context.Context, client *s3.Client) error {
+
+	log.Println("Checking MinIO connection...")
+
+	_, err := client.ListBuckets(
+		ctx,
+		&s3.ListBucketsInput{},
 	)
-
-	// Connect MinIO
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds: credentials.NewStaticV4(
-			accessKey,
-			secretKey,
-			"",
-		),
-		Secure: false,
-	})
-
 	if err != nil {
-		log.Fatalf("❌ Gagal membuat client MinIO: %v", err)
+		return fmt.Errorf("cannot connect to MinIO: %w", err)
 	}
 
-	// Test koneksi MinIO
+	log.Println("MinIO connection OK")
+
+	_, err = client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(Bucket),
+	})
+	if err == nil {
+		log.Printf("Bucket '%s' already exists\n", Bucket)
+		return nil
+	}
+
+	log.Printf("Bucket '%s' not found, creating...\n", Bucket)
+
+	_, err = client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(Bucket),
+	})
+	if err != nil {
+		return fmt.Errorf("failed create bucket: %w", err)
+	}
+
+	log.Printf("Bucket '%s' created successfully\n", Bucket)
+
+	return nil
+}
+
+func main() {
+
 	ctx := context.Background()
 
-	exists, err := client.BucketExists(ctx, bucket)
+	cfg, err := config.LoadDefaultConfig(
+		ctx,
+		config.WithRegion(Region),
+		config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(
+				AccessKey,
+				SecretKey,
+				"",
+			),
+		),
+	)
+
 	if err != nil {
-		log.Fatalf("❌ Tidak bisa connect ke MinIO: %v", err)
+		log.Fatal("AWS config error:", err)
 	}
 
-	if !exists {
-		err = client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(Endpoint)
+		o.UsePathStyle = true
+	})
 
-		if err != nil {
-			log.Fatalf("❌ Gagal membuat bucket %s: %v", bucket, err)
-		}
-
-		log.Printf("✅ Bucket '%s' berhasil dibuat", bucket)
-	} else {
-		log.Printf("✅ Bucket '%s' sudah tersedia", bucket)
+	// cek MinIO + bucket
+	if err := initMinioBucket(ctx, client); err != nil {
+		log.Fatal(err)
 	}
 
-	log.Println("✅ Berhasil connect ke MinIO")
-	log.Printf("📦 Bucket : %s\n", bucket)
-	log.Printf("🌐 MinIO  : http://%s\n", endpoint)
+	presignClient := s3.NewPresignClient(client)
 
 	r := gin.Default()
 
 	r.Use(cors.New(cors.Config{
+
 		AllowOrigins: []string{
 			"http://localhost:5173",
 		},
+
 		AllowMethods: []string{
 			"GET",
 			"POST",
@@ -75,82 +111,97 @@ func main() {
 			"DELETE",
 			"OPTIONS",
 		},
+
 		AllowHeaders: []string{
 			"Origin",
 			"Content-Type",
 			"Accept",
 			"Authorization",
 		},
-		ExposeHeaders: []string{
-			"Content-Length",
-		},
+
 		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
+
+		MaxAge: 12 * time.Hour,
 	}))
-	
+
+	// Generate presigned upload URL
 	r.POST("/upload-url", func(c *gin.Context) {
 
 		fileName := c.Query("filename")
+
 		if fileName == "" {
-			c.JSON(http.StatusBadRequest, gin.H{
+			c.JSON(400, gin.H{
 				"error": "filename wajib diisi",
 			})
 			return
 		}
 
-		objectName := fmt.Sprintf("%s-%s", uuid.New().String(), fileName)
+		objectKey := fmt.Sprintf(
+			"%s-%s",
+			uuid.New().String(),
+			fileName,
+		)
 
-		url, err := client.PresignedPutObject(
+		result, err := presignClient.PresignPutObject(
 			ctx,
-			bucket,
-			objectName,
-			15*time.Minute,
+			&s3.PutObjectInput{
+				Bucket: aws.String(Bucket),
+				Key:    aws.String(objectKey),
+			},
+			func(opts *s3.PresignOptions) {
+				opts.Expires = 15 * time.Minute
+			},
 		)
 
 		if err != nil {
-			log.Printf("PresignedPutObject error: %v", err)
-
-			c.JSON(http.StatusInternalServerError, gin.H{
+			c.JSON(500, gin.H{
 				"error": err.Error(),
 			})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"uploadUrl": url.String(),
-			"objectKey": objectName,
+		c.JSON(200, gin.H{
+			"uploadUrl": result.URL,
+			"objectKey": objectKey,
 		})
 	})
 
+	// Generate presigned download URL
 	r.GET("/download-url/:object", func(c *gin.Context) {
 
 		object := c.Param("object")
 
-		url, err := client.PresignedGetObject(
+		result, err := presignClient.PresignGetObject(
 			ctx,
-			bucket,
-			object,
-			30*time.Minute,
-			nil,
+			&s3.GetObjectInput{
+				Bucket: aws.String(Bucket),
+				Key:    aws.String(object),
+			},
+			func(opts *s3.PresignOptions) {
+				opts.Expires = 30 * time.Minute
+			},
 		)
 
 		if err != nil {
-			log.Printf("PresignedGetObject error: %v", err)
 
-			c.JSON(http.StatusInternalServerError, gin.H{
+			c.JSON(500, gin.H{
 				"error": err.Error(),
 			})
+
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"url": url.String(),
+		c.JSON(200, gin.H{
+			"url": result.URL,
 		})
 	})
 
-	log.Printf("🚀 Server berjalan di http://localhost:%s\n", port)
+	log.Printf(
+		"🚀 Server berjalan di http://localhost%s",
+		ServerPort,
+	)
 
-	if err := r.Run(":" + port); err != nil {
-		log.Fatal(err)
-	}
+	log.Fatal(
+		r.Run(ServerPort),
+	)
 }
