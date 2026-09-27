@@ -3,6 +3,9 @@ import './App.css';
 
 const CHUNK_SIZE = 5 * 1024 * 1024;
 
+const MAX_CONCURRENT_UPLOADS = 5;
+const MAX_RETRIES = 3;
+
 export default function App() {
   const [file, setFile] = useState(null);
   const [downloadUrl, setDownloadUrl] = useState('');
@@ -65,49 +68,138 @@ export default function App() {
       setStatus(`Uploading ${totalParts} chunks...`);
 
       let uploadedParts = 0;
+      let nextPartIndex = 0;
+      let uploadFailed = false;
+      const completedParts = [];
 
-      const uploadPromises = initData.parts.map(async (part) => {
+      const activeControllers = new Set();
+
+      const uploadPart = async (part) => {
         const start = (part.partNumber - 1) * CHUNK_SIZE;
-
         const end = Math.min(start + CHUNK_SIZE, file.size);
-
         const blob = file.slice(start, end);
 
-        console.log(`UPLOAD PART ${part.partNumber}`, {
-          start,
-          end,
-          size: blob.size,
-        });
+        let lastError;
 
-        const uploadRes = await fetch(part.uploadUrl, {
-          method: 'PUT',
-          body: blob,
-        });
+        for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+          if (uploadFailed) {
+            throw new Error('Upload dihentikan karena part lain gagal');
+          }
 
-        console.log(`PART ${part.partNumber} RESPONSE`, {
-          status: uploadRes.status,
+          const controller = new AbortController();
 
-          headers: Object.fromEntries(uploadRes.headers.entries()),
-        });
+          activeControllers.add(controller);
 
-        const etag = uploadRes.headers.get('ETag');
+          try {
+            console.log(`UPLOAD PART ${part.partNumber}`, {
+              start,
+              end,
+              size: blob.size,
+              attempt,
+            });
 
-        if (!etag) {
-          throw new Error(`ETag part ${part.partNumber} tidak ditemukan`);
+            const uploadRes = await fetch(part.uploadUrl, {
+              method: 'PUT',
+              body: blob,
+              signal: controller.signal,
+            });
+
+            console.log(`PART ${part.partNumber} RESPONSE`, {
+              status: uploadRes.status,
+              attempt,
+              headers: Object.fromEntries(uploadRes.headers.entries()),
+            });
+
+            if (!uploadRes.ok) {
+              throw new Error(
+                `Upload part ${part.partNumber} gagal dengan status ${uploadRes.status}`
+              );
+            }
+
+            const etag = uploadRes.headers.get('ETag');
+
+            if (!etag) {
+              throw new Error(`ETag part ${part.partNumber} tidak ditemukan`);
+            }
+
+            uploadedParts++;
+
+            setProgress(Math.round((uploadedParts / totalParts) * 100));
+
+            return {
+              partNumber: part.partNumber,
+              etag,
+            };
+          } catch (error) {
+            lastError = error;
+
+            if (uploadFailed) {
+              throw error;
+            }
+
+            if (attempt <= MAX_RETRIES) {
+              console.warn(
+                `PART ${part.partNumber} gagal. Retry ${attempt}/${MAX_RETRIES}`
+              );
+            }
+          } finally {
+            activeControllers.delete(controller);
+          }
         }
 
-        uploadedParts++;
+        uploadFailed = true;
 
-        setProgress(Math.round((uploadedParts / totalParts) * 100));
+        for (const controller of activeControllers) {
+          controller.abort();
+        }
 
-        return {
-          partNumber: part.partNumber,
+        throw lastError;
+      };
 
-          etag,
-        };
-      });
+      const worker = async (workerId) => {
+        while (!uploadFailed) {
+          const currentIndex = nextPartIndex;
 
-      const completedParts = await Promise.all(uploadPromises);
+          if (currentIndex >= initData.parts.length) {
+            return;
+          }
+
+          nextPartIndex++;
+
+          const part = initData.parts[currentIndex];
+
+          console.log(`WORKER ${workerId} menjalankan PART ${part.partNumber}`);
+
+          try {
+            const result = await uploadPart(part);
+
+            completedParts.push(result);
+          } catch (error) {
+            uploadFailed = true;
+
+            for (const controller of activeControllers) {
+              controller.abort();
+            }
+
+            throw error;
+          }
+        }
+      };
+
+      const workerCount = Math.min(
+        MAX_CONCURRENT_UPLOADS,
+        initData.parts.length
+      );
+
+      const workers = Array.from({ length: workerCount }, (_, index) =>
+        worker(index + 1)
+      );
+
+      await Promise.all(workers);
+
+      if (uploadFailed) {
+        throw new Error('Upload gagal');
+      }
 
       console.log('COMPLETED PARTS:', completedParts);
 
